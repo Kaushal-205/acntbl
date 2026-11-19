@@ -43,7 +43,7 @@ contract UnderwritingVault is CollateralModule, IUnderwritingVault {
 
     function fundPremium(uint256 epochId, uint256 amount) external nonReentrant {
         Pool storage pool = pools[epochId];
-        if (pool.released || pool.totalShares == 0 || amount == 0) revert InvalidState();
+        if (block.timestamp < pool.depositsClose || pool.released || pool.totalShares == 0 || amount == 0) revert InvalidState();
         pool.premiums += amount;
         _collect(msg.sender, amount);
         emit PremiumFunded(epochId, msg.sender, amount);

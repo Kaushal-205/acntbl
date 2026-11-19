@@ -6,6 +6,56 @@ import {MerkleProof} from "@openzeppelin/contracts/utils/cryptography/MerkleProo
 import {CollateralModule, IERC20} from "./CollateralModule.sol";
 
 contract CompensationEscrow is CollateralModule {
+    struct Entry {
+        bytes32 id;
+        address victim;
+        uint256 loss;
+    }
+
+    mapping(uint256 => mapping(bytes32 => uint256)) public publishedTotal;
+    mapping(bytes32 => mapping(bytes32 => uint256)) public precedingLoss;
+    event ClaimEntry(uint256 indexed epochId, bytes32 indexed root, bytes32 indexed id, address victim, uint256 loss);
+
+    /// @notice Publish the canonical claimant set in calldata and logs before the challenge period.
+    /// Entries are ordered by unique claim ID. Odd trailing nodes are promoted unmodified.
+    function publish(uint256 epochId, Entry[] calldata entries) external returns (bytes32 root) {
+        uint256 size = entries.length;
+        if (size == 0 || size > 128) revert InvalidInput();
+        bytes32[] memory nodes = new bytes32[](size);
+        uint256 total;
+        bytes32 previous;
+        for (uint256 i; i < size; ++i) {
+            Entry calldata entry = entries[i];
+            if (entry.id <= previous || entry.victim == address(0) || entry.loss == 0) revert InvalidInput();
+            previous = entry.id;
+            total += entry.loss;
+            nodes[i] = claimLeaf(epochId, entry.id, entry.victim, entry.loss);
+        }
+        while (size > 1) {
+            uint256 parents;
+            for (uint256 i; i < size; i += 2) {
+                bytes32 a = nodes[i];
+                if (i + 1 < size) {
+                    bytes32 b = nodes[i+1];
+                    a = a < b ? keccak256(abi.encodePacked(a,b)) : keccak256(abi.encodePacked(b,a));
+                }
+                nodes[parents++] = a;
+            }
+            size = parents;
+        }
+        root = nodes[0];
+        if (publishedTotal[epochId][root] == 0) {
+            publishedTotal[epochId][root] = total;
+            uint256 prefix;
+            for (uint256 i; i < entries.length; ++i) {
+                Entry calldata entry = entries[i];
+                precedingLoss[root][entry.id] = prefix;
+                prefix += entry.loss;
+                emit ClaimEntry(epochId, root, entry.id, entry.victim, entry.loss);
+            }
+        }
+    }
+
     struct Settlement {
         bytes32 root;
         uint256 verifiedClaims;
@@ -46,7 +96,9 @@ contract CompensationEscrow is CollateralModule {
         }
         claimed[epochId][claimId] = true;
         settlement.claimedLoss += loss;
-        amount = Math.mulDiv(loss, settlement.funded, settlement.verifiedClaims);
+        uint256 prefix = precedingLoss[settlement.root][claimId];
+        amount = Math.mulDiv(prefix + loss, settlement.funded, settlement.verifiedClaims)
+            - Math.mulDiv(prefix, settlement.funded, settlement.verifiedClaims);
         settlement.paid += amount;
         _pay(victim, amount);
         emit Compensated(epochId, claimId, victim, loss, amount);

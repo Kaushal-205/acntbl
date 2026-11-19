@@ -17,6 +17,10 @@ contract MockOracle is IIncidentOracle, CollateralModule, EIP712 {
     );
     uint256 public constant MAX_ATTESTERS = 32;
 
+    bytes32 public constant CORRECTION_TYPEHASH = keccak256("Correction(bytes32 reportDigest)");
+    mapping(uint256 => uint256) public correctionDeadline;
+    event CorrectionOpened(uint256 indexed epochId, uint256 deadline);
+
     struct Terms {
         uint64 opensAt;
         uint64 endsAt;
@@ -39,6 +43,13 @@ contract MockOracle is IIncidentOracle, CollateralModule, EIP712 {
         uint64 arbitrationEnds;
         uint256 signers;
     }
+
+    address[] public committee;
+    mapping(address => bool) public retired;
+    mapping(address => uint256) public lockedUntil;
+    mapping(uint256 => mapping(address => uint256)) public epochBit;
+    mapping(uint256 => uint256) public evidenceDeadline;
+    event CommitteeReplaced(address indexed prior, address indexed replacement);
 
     address public immutable deployer;
     address public immutable arbitrator;
@@ -69,7 +80,7 @@ contract MockOracle is IIncidentOracle, CollateralModule, EIP712 {
     event ReportAsserted(uint256 indexed epochId, bytes32 indexed digest, address indexed proposer, uint64 challengeEnds);
     event ReportChallenged(uint256 indexed epochId, address indexed challenger, bytes32 counterEvidenceHash);
     event DoubleSignProven(uint256 indexed epochId, address indexed attester, uint256 collateralForfeited);
-    event EpochSettled(uint256 indexed epochId, Outcome result, uint256 verifiedLoss, uint256 funded, bytes32 reportHash);
+    event EpochSettled(uint256 indexed epochId, Outcome result, uint256 recognizedLoss, uint256 funded, bytes32 evidenceHash);
 
     constructor(
         IERC20 token,
@@ -96,6 +107,7 @@ contract MockOracle is IIncidentOracle, CollateralModule, EIP712 {
         for (uint256 i; i < attesters.length; ++i) {
             address signer = attesters[i];
             if (signer == address(0) || attesterBit[signer] != 0) revert InvalidInput();
+            committee.push(signer);
             attesterBit[signer] = 1 << i;
             attesterCredibility[signer] = 10_000;
         }
@@ -125,11 +137,50 @@ contract MockOracle is IIncidentOracle, CollateralModule, EIP712 {
     }
 
     function bondAttester() external nonReentrant {
-        if (attesterBit[msg.sender] == 0 || attesterCollateral[msg.sender] != 0
+        if (retired[msg.sender] || attesterBit[msg.sender] == 0 || attesterCollateral[msg.sender] != 0
             || attesterCredibility[msg.sender] == 0) revert InvalidState();
         attesterCollateral[msg.sender] = attesterBond;
         _collect(msg.sender, attesterBond);
         emit AttesterBonded(msg.sender);
+    }
+
+    function retire() external {
+        if (attesterBit[msg.sender] == 0) revert Unauthorized();
+        retired[msg.sender] = true;
+    }
+
+    function withdrawAttesterBond() external nonReentrant {
+        if (!retired[msg.sender] || block.timestamp <= lockedUntil[msg.sender]) revert InvalidState();
+        uint256 amount = attesterCollateral[msg.sender];
+        if (amount == 0) revert InvalidState();
+        delete attesterCollateral[msg.sender];
+        _pay(msg.sender, amount);
+    }
+
+    function replaceSeat(uint256 seat, address replacement) external {
+        if (msg.sender != arbitrator) revert Unauthorized();
+        address prior = committee[seat];
+        if ((!retired[prior] && attesterCredibility[prior] != 0) || replacement == address(0)
+            || attesterBit[replacement] != 0) revert InvalidInput();
+        committee[seat] = replacement;
+        attesterBit[replacement] = 1 << seat;
+        attesterCredibility[replacement] = 10_000;
+        emit CommitteeReplaced(prior, replacement);
+    }
+
+    function _snapshot(uint256 epochId, uint64 endsAt) private {
+        uint256 deadline = uint256(endsAt) + 2 * (uint256(reportingWindow) + challengeWindow + arbitrationWindow);
+        evidenceDeadline[epochId] = deadline;
+        uint256 members;
+        for (uint256 i; i < committee.length; ++i) {
+            address signer = committee[i];
+            if (!retired[signer] && attesterCollateral[signer] == attesterBond) {
+                epochBit[epochId][signer] = attesterBit[signer];
+                lockedUntil[signer] = Math.max(lockedUntil[signer], deadline);
+                ++members;
+            }
+        }
+        if (members < quorum) revert InvalidState();
     }
 
     function openEpoch(uint256 agentId, Terms calldata terms) external nonReentrant returns (uint256 epochId) {
@@ -141,6 +192,7 @@ contract MockOracle is IIncidentOracle, CollateralModule, EIP712 {
         }
         epochId = nextEpochId++;
         epochs[epochId] = Epoch(agentId, terms, Outcome.Pending);
+        _snapshot(epochId, terms.endsAt);
         registry.lock(agentId, epochId, msg.sender);
         vault.openPool(epochId, terms.opensAt);
         market.openMarket(epochId, terms.opensAt);
@@ -160,20 +212,39 @@ contract MockOracle is IIncidentOracle, CollateralModule, EIP712 {
     }
 
     function reportDigest(Report calldata report) public view returns (bytes32) {
-        return _hashTypedDataV4(keccak256(abi.encode(
+        return _roundDigest(report, correctionDeadline[report.epochId] != 0);
+    }
+
+    function _roundDigest(Report calldata report, bool correction) private view returns (bytes32) {
+        bytes32 digest = _hashTypedDataV4(keccak256(abi.encode(
             REPORT_TYPEHASH, report.epochId, report.exactLoss, report.severity, report.evidenceHash,
             report.claimsRoot, report.totalClaims
         )));
+        return correction ? _hashTypedDataV4(keccak256(abi.encode(CORRECTION_TYPEHASH, digest))) : digest;
+    }
+
+    mapping(bytes32 => bool) public evidenceAvailable;
+    event EvidencePublished(bytes32 indexed digest, bytes evidence);
+
+    function publishEvidence(bytes calldata evidence) external {
+        if (evidence.length == 0 || evidence.length > 24_576) revert InvalidInput();
+        bytes32 digest = keccak256(evidence);
+        if (!evidenceAvailable[digest]) {
+            evidenceAvailable[digest] = true;
+            emit EvidencePublished(digest, evidence);
+        }
     }
 
     function assertReport(Report calldata report, bytes[] calldata signatures) external nonReentrant {
         Epoch storage epoch = epochs[report.epochId];
         if (epoch.agentId == 0 || block.timestamp < epoch.terms.endsAt
-            || block.timestamp >= uint256(epoch.terms.endsAt) + reportingWindow
+            || block.timestamp >= _reportDeadline(report.epochId)
             || epoch.result != Outcome.Pending || assertions[report.epochId].proposer != address(0)) {
             revert InvalidState();
         }
         _validateReport(epoch.terms, report);
+        if (!evidenceAvailable[report.evidenceHash] || (report.totalClaims != 0
+            && escrow.publishedTotal(report.epochId, report.claimsRoot) != report.totalClaims)) revert InvalidInput();
         bytes32 digest = reportDigest(report);
         uint256 signed = _verifySignatures(report.epochId, digest, signatures);
         uint64 challengeEnds = uint64(block.timestamp) + challengeWindow;
@@ -188,7 +259,7 @@ contract MockOracle is IIncidentOracle, CollateralModule, EIP712 {
         if (signatures.length < quorum || signatures.length > MAX_ATTESTERS) revert InvalidInput();
         for (uint256 i; i < signatures.length; ++i) {
             address signer = ECDSA.recover(digest, signatures[i]);
-            uint256 bit = attesterBit[signer];
+            uint256 bit = epochBit[epochId][signer];
             if (bit == 0 || attesterCollateral[signer] != attesterBond
                 || ((signed | disqualifiedSigners[epochId]) & bit) != 0) revert InvalidInput();
             signed |= bit;
@@ -220,16 +291,30 @@ contract MockOracle is IIncidentOracle, CollateralModule, EIP712 {
     function proveDoubleSign(Report calldata first, bytes calldata sigA, Report calldata second, bytes calldata sigB)
         external nonReentrant
     {
+        _prove(first, sigA, second, sigB, false);
+    }
+
+    function proveCorrectionDoubleSign(Report calldata first, bytes calldata sigA, Report calldata second, bytes calldata sigB)
+        external nonReentrant
+    {
+        if (correctionDeadline[first.epochId] == 0) revert InvalidState();
+        _prove(first, sigA, second, sigB, true);
+    }
+
+    function _prove(Report calldata first, bytes calldata sigA, Report calldata second, bytes calldata sigB, bool correction)
+        private
+    {
         uint256 epochId = first.epochId;
-        if (epochId != second.epochId || epochs[epochId].agentId == 0
+        if (block.timestamp > evidenceDeadline[epochId] || epochId != second.epochId || epochs[epochId].agentId == 0
             || block.timestamp < epochs[epochId].terms.endsAt) revert InvalidInput();
-        bytes32 digestA = reportDigest(first);
-        bytes32 digestB = reportDigest(second);
-        if (digestA == digestB) revert InvalidInput();
+        bytes32 digestA = _roundDigest(first, correction);
+        bytes32 digestB = _roundDigest(second, correction);
+        if (first.exactLoss == second.exactLoss && first.severity == second.severity
+            && first.claimsRoot == second.claimsRoot && first.totalClaims == second.totalClaims) revert InvalidInput();
         _validateReport(epochs[epochId].terms, first);
         _validateReport(epochs[epochId].terms, second);
         address signer = ECDSA.recover(digestA, sigA);
-        uint256 bit = attesterBit[signer];
+        uint256 bit = epochBit[epochId][signer];
         if (bit == 0 || signer != ECDSA.recover(digestB, sigB)
             || (disqualifiedSigners[epochId] & bit) != 0) revert InvalidInput();
         disqualifiedSigners[epochId] |= bit;
@@ -245,7 +330,7 @@ contract MockOracle is IIncidentOracle, CollateralModule, EIP712 {
         Assertion storage assertion = assertions[epochId];
         if (epoch.agentId == 0 || epoch.result != Outcome.Pending) revert InvalidState();
         if (assertion.proposer == address(0)) {
-            if (block.timestamp < uint256(epoch.terms.endsAt) + reportingWindow) revert InvalidState();
+            if (block.timestamp < _reportDeadline(epochId)) revert InvalidState();
             _settle(epochId, Outcome.Void);
         } else if (assertion.challenger != address(0)) {
             if (block.timestamp < assertion.arbitrationEnds) revert InvalidState();
@@ -290,18 +375,33 @@ contract MockOracle is IIncidentOracle, CollateralModule, EIP712 {
         return assertion.report.totalClaims == 0 ? Outcome.NoFailure : Outcome.Failure;
     }
 
+    function _reportDeadline(uint256 epochId) private view returns (uint256) {
+        uint256 deadline = correctionDeadline[epochId];
+        return deadline == 0 ? uint256(epochs[epochId].terms.endsAt) + reportingWindow : deadline;
+    }
+
     function _settle(uint256 epochId, Outcome result) private {
         Epoch storage epoch = epochs[epochId];
         Report storage report = assertions[epochId].report;
+        uint256 latestCorrection = evidenceDeadline[epochId] - challengeWindow - arbitrationWindow;
+        if (result == Outcome.Void && correctionDeadline[epochId] == 0 && block.timestamp < latestCorrection) {
+            uint256 deadline = Math.min(block.timestamp + reportingWindow, latestCorrection);
+            correctionDeadline[epochId] = deadline;
+            delete assertions[epochId];
+            emit CorrectionOpened(epochId, deadline);
+            return;
+        }
         epoch.result = result;
         uint256 loss;
         uint256 funded;
         if (result == Outcome.Failure) {
             loss = Math.min(report.totalClaims, epoch.terms.lossCap);
             address recipient = address(escrow);
+            uint256 balanceBefore = collateral.balanceOf(recipient);
             funded = market.resolve(epochId, result, loss, recipient);
             funded += registry.settle(epoch.agentId, epochId, loss, epoch.terms.lossCap, loss - funded, recipient);
             funded += vault.slash(epochId, loss - funded, recipient);
+            if (collateral.balanceOf(recipient) - balanceBefore != funded) revert UnsupportedCollateral();
             escrow.open(epochId, report.claimsRoot, report.totalClaims, funded);
         } else {
             market.resolve(epochId, result, 0, address(escrow));

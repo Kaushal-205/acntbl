@@ -21,6 +21,10 @@ contract AgentRegistry is CollateralModule {
 
     mapping(uint256 => Agent) public agents;
 
+    mapping(address => uint256) public providerIncidents;
+    mapping(address => uint256) public providerRecognizedLoss;
+    mapping(address => uint256) public providerBondSeized;
+
     event AgentRegistered(uint256 indexed agentId, address indexed provider, uint8 riskTier, string metadataURI);
     event BondChanged(uint256 indexed agentId, uint256 balance);
     event CredibilityChanged(uint256 indexed agentId, uint256 indexed epochId, uint256 score, uint256 verifiedLoss);
@@ -76,10 +80,13 @@ contract AgentRegistry is CollateralModule {
         agent.activeEpoch = 0;
         if (verifiedLoss != 0) {
             ++agent.incidents;
+            ++providerIncidents[agent.provider];
+            providerRecognizedLoss[agent.provider] += verifiedLoss;
             uint256 penalty = Math.max(1, Math.mulDiv(verifiedLoss, MAX_SCORE, lossCap));
             agent.credibility -= Math.min(agent.credibility, penalty);
             seized = Math.min(agent.bond, requestedBond);
             agent.bond -= seized;
+            providerBondSeized[agent.provider] += seized;
             _pay(recipient, seized);
             emit BondChanged(id, agent.bond);
             emit CredibilityChanged(id, epochId, agent.credibility, verifiedLoss);

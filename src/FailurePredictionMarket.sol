@@ -9,6 +9,7 @@ contract FailurePredictionMarket is CollateralModule {
     uint256 public constant BPS = 10_000;
     uint256 public immutable feeBps;
     address public immutable reserveRecipient;
+    uint256 public immutable maxEpochVolume;
 
     struct Market {
         uint64 closesAt;
@@ -31,8 +32,9 @@ contract FailurePredictionMarket is CollateralModule {
     event MarketResolved(uint256 indexed epochId, IIncidentOracle.Outcome result, uint256 victimReserve);
     event MarketClaimed(uint256 indexed epochId, address indexed trader, uint256 amount);
 
-    constructor(IERC20 token, address authority, uint256 fee, address treasury) CollateralModule(token, authority) {
-        if (fee == 0 || fee > 1_000 || treasury == address(0)) revert InvalidInput();
+    constructor(IERC20 token, address authority, uint256 fee, address treasury, uint256 volumeCap) CollateralModule(token, authority) {
+        if (volumeCap == 0 || fee == 0 || fee > 1_000 || treasury == address(0)) revert InvalidInput();
+        maxEpochVolume = volumeCap;
         feeBps = fee;
         reserveRecipient = treasury;
     }
@@ -45,6 +47,7 @@ contract FailurePredictionMarket is CollateralModule {
     function buy(uint256 epochId, bool failure, uint256 amount) external nonReentrant {
         Market storage market = markets[epochId];
         if (block.timestamp >= market.closesAt || amount == 0) revert InvalidState();
+        if (amount > maxEpochVolume - market.yes - market.no - market.reserve) revert InvalidInput();
         uint256 fee = Math.mulDiv(amount, feeBps, BPS, Math.Rounding.Ceil);
         if (fee >= amount) revert InvalidInput();
         uint256 net = amount - fee;
@@ -70,6 +73,15 @@ contract FailurePredictionMarket is CollateralModule {
         return (Math.mulDiv(market.yes, BPS, total), true);
     }
 
+    uint256 public treasuryCredit;
+
+    function withdrawFees() external nonReentrant {
+        uint256 amount = treasuryCredit;
+        if (amount == 0) revert InvalidState();
+        treasuryCredit = 0;
+        _pay(reserveRecipient, amount);
+    }
+
     function resolve(uint256 epochId, IIncidentOracle.Outcome result, uint256 maximum, address escrow)
         external onlyCoordinator nonReentrant returns (uint256 victimReserve)
     {
@@ -81,7 +93,7 @@ contract FailurePredictionMarket is CollateralModule {
             victimReserve = Math.min(market.reserve, maximum);
             _pay(escrow, victimReserve);
         }
-        if (result != IIncidentOracle.Outcome.Void) _pay(reserveRecipient, market.reserve - victimReserve);
+        if (result != IIncidentOracle.Outcome.Void) treasuryCredit += market.reserve - victimReserve;
         emit MarketResolved(epochId, result, victimReserve);
     }
 

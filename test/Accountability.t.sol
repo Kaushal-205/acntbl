@@ -57,9 +57,10 @@ contract AccountabilityTest is Test {
         );
         registry = new AgentRegistry(token, address(oracle), 25 ether);
         vault = new UnderwritingVault(token, address(oracle));
-        market = new FailurePredictionMarket(token, address(oracle), 500, TREASURY);
+        market = new FailurePredictionMarket(token, address(oracle), 500, TREASURY, 20_000 ether);
         escrow = new CompensationEscrow(token, address(oracle));
         oracle.bind(registry, vault, market, escrow);
+        oracle.publishEvidence(bytes("deterministic execution trace"));
 
         for (uint256 i; i < committee.length; ++i) {
             _fund(committee[i], address(oracle), 10 ether);
@@ -83,9 +84,10 @@ contract AccountabilityTest is Test {
         _stake(STAKER_A, 600 ether);
         _stake(STAKER_B, 400 ether);
         _fund(address(this), address(vault), 100 ether);
-        vault.fundPremium(epochId, 100 ether);
         _trade(YES_TRADER, true, 100 ether);
         _trade(NO_TRADER, false, 300 ether);
+        vm.warp(opensAt);
+        vault.fundPremium(epochId, 100 ether);
         (uint256 implied, bool traded) = market.impliedFailureBps(epochId);
         assertTrue(traded);
         assertEq(implied, 2500);
@@ -101,6 +103,7 @@ contract AccountabilityTest is Test {
         assertEq(market.claim(epochId), 380 ether);
         vm.prank(YES_TRADER);
         assertEq(market.claim(epochId), 0);
+        market.withdrawFees();
         assertEq(token.balanceOf(TREASURY), 20 ether);
         vm.prank(PROVIDER);
         registry.withdrawBond(agentId, 100 ether);
@@ -115,6 +118,10 @@ contract AccountabilityTest is Test {
         bytes32 a = escrow.claimLeaf(epochId, CLAIM_A, VICTIM_A, 400 ether);
         bytes32 b = escrow.claimLeaf(epochId, CLAIM_B, VICTIM_B, 200 ether);
         bytes32 root = a < b ? keccak256(abi.encodePacked(a, b)) : keccak256(abi.encodePacked(b, a));
+        CompensationEscrow.Entry[] memory entries = new CompensationEscrow.Entry[](2);
+        entries[CLAIM_A < CLAIM_B ? 0 : 1] = CompensationEscrow.Entry(CLAIM_A, VICTIM_A, 400 ether);
+        entries[CLAIM_A < CLAIM_B ? 1 : 0] = CompensationEscrow.Entry(CLAIM_B, VICTIM_B, 200 ether);
+        assertEq(escrow.publish(epochId, entries), root);
         _assertReport(IIncidentOracle.Report(epochId, 600 ether, 0, EVIDENCE, root, 600 ether));
         _challenge();
         vm.warp(oracle.getAssertion(epochId).challengeEnds);
@@ -198,6 +205,8 @@ contract AccountabilityTest is Test {
         vm.warp(oracle.getAssertion(epochId).challengeEnds);
         vm.prank(ARBITRATOR);
         oracle.arbitrate(epochId, false);
+        vm.warp(oracle.correctionDeadline(epochId));
+        oracle.finalize(epochId);
         assertEq(uint256(oracle.outcome(epochId)), uint256(IIncidentOracle.Outcome.Void));
         assertEq(oracle.bondCredit(CHALLENGER), 10 ether);
         vm.prank(CHALLENGER);
@@ -217,6 +226,8 @@ contract AccountabilityTest is Test {
         vm.expectRevert(CollateralModule.InvalidState.selector);
         oracle.arbitrate(epochId, true);
         oracle.finalize(epochId);
+        vm.warp(oracle.correctionDeadline(epochId));
+        oracle.finalize(epochId);
         assertEq(uint256(oracle.outcome(epochId)), uint256(IIncidentOracle.Outcome.Void));
         assertEq(oracle.bondCredit(CHALLENGER), 5 ether);
         assertEq(oracle.bondCredit(address(this)), 5 ether);
@@ -227,6 +238,8 @@ contract AccountabilityTest is Test {
     function testMissingReportVoidsAtReportingDeadline() public {
         _trade(NO_TRADER, false, 100 ether);
         vm.warp(endsAt + oracle.reportingWindow());
+        oracle.finalize(epochId);
+        vm.warp(oracle.correctionDeadline(epochId));
         oracle.finalize(epochId);
         assertEq(uint256(oracle.outcome(epochId)), uint256(IIncidentOracle.Outcome.Void));
         vm.prank(NO_TRADER);
@@ -246,8 +259,27 @@ contract AccountabilityTest is Test {
         vm.expectRevert(CollateralModule.InvalidInput.selector);
         oracle.proveDoubleSign(second, sigB, first, sigA);
         _finalizeUnchallenged();
+        vm.warp(oracle.correctionDeadline(epochId));
+        oracle.finalize(epochId);
         assertEq(uint256(oracle.outcome(epochId)), uint256(IIncidentOracle.Outcome.Void));
         assertEq(token.balanceOf(address(escrow)), 0);
+    }
+
+    function testRejectedReportCanBeCorrectedWithCapitalStillLocked() public {
+        _stake(STAKER_A, 300 ether);
+        _assertReport(_noFailure());
+        _challenge();
+        vm.warp(oracle.getAssertion(epochId).challengeEnds);
+        vm.prank(ARBITRATOR);
+        oracle.arbitrate(epochId, false);
+        vm.prank(STAKER_A);
+        vm.expectRevert(CollateralModule.InvalidState.selector);
+        vault.redeem(epochId);
+        IIncidentOracle.Report memory corrected = _singleClaim(250 ether);
+        _fund(address(this), address(oracle), oracle.disputeBond());
+        oracle.assertReport(corrected, _signatures(corrected));
+        _finalizeUnchallenged();
+        assertEq(escrow.claim(epochId, CLAIM_A, VICTIM_A, 250 ether, new bytes32[](0)), 250 ether);
     }
 
     function testDuplicateAttesterAndInconsistentLossRejected() public {
@@ -288,8 +320,47 @@ contract AccountabilityTest is Test {
         uint256 fees = (yes + 19) / 20 + (no + 19) / 20;
         vm.prank(NO_TRADER);
         assertEq(market.claim(epochId), yes + no - fees);
+        market.withdrawFees();
         assertEq(token.balanceOf(TREASURY), fees);
         assertEq(token.balanceOf(address(market)), 0);
+    }
+
+    function testCommitteeExitKeepsOldBondAtRiskAndReplacementOutOfOldEpoch() public {
+        address signer = vm.addr(KEY_A);
+        vm.prank(signer);
+        oracle.retire();
+        vm.prank(signer);
+        vm.expectRevert(CollateralModule.InvalidState.selector);
+        oracle.withdrawAttesterBond();
+        vm.prank(ARBITRATOR);
+        oracle.replaceSeat(0, address(777));
+        assertEq(oracle.epochBit(epochId, address(777)), 0);
+        assertEq(oracle.epochBit(epochId, signer), 1);
+        vm.warp(oracle.evidenceDeadline(epochId) + 1);
+        vm.prank(signer);
+        oracle.withdrawAttesterBond();
+        assertEq(token.balanceOf(signer), 10 ether);
+    }
+
+    function testAdmissionRejectsUnpublishedEvidenceAndClaimRoots() public {
+        vm.warp(endsAt);
+        IIncidentOracle.Report memory r = _noFailure();
+        r.evidenceHash = keccak256("unpublished");
+        bytes[] memory signatures = _signatures(r);
+        vm.expectRevert(CollateralModule.InvalidInput.selector);
+        oracle.assertReport(r, signatures);
+        r = IIncidentOracle.Report(epochId, 1, 0, EVIDENCE, keccak256("unknown root"), 1);
+        signatures = _signatures(r);
+        vm.expectRevert(CollateralModule.InvalidInput.selector);
+        oracle.assertReport(r, signatures);
+    }
+
+    function testMarketVolumeCapAndPremiumTiming() public {
+        _stake(STAKER_A, 100 ether);
+        vm.expectRevert(CollateralModule.InvalidState.selector);
+        vault.fundPremium(epochId, 1);
+        vm.expectRevert(CollateralModule.InvalidInput.selector);
+        market.buy(epochId, false, 20_000 ether + 1);
     }
 
     function _fund(address account, address spender, uint256 amount) private {
@@ -314,8 +385,15 @@ contract AccountabilityTest is Test {
         return IIncidentOracle.Report(epochId, 0, 0, EVIDENCE, bytes32(0), 0);
     }
 
-    function _singleClaim(uint256 loss) private view returns (IIncidentOracle.Report memory) {
+    function _singleClaim(uint256 loss) private returns (IIncidentOracle.Report memory) {
+        _publishSingle(loss);
         return IIncidentOracle.Report(epochId, loss, 0, EVIDENCE, escrow.claimLeaf(epochId, CLAIM_A, VICTIM_A, loss), loss);
+    }
+
+    function _publishSingle(uint256 loss) private {
+        CompensationEscrow.Entry[] memory entries = new CompensationEscrow.Entry[](1);
+        entries[0] = CompensationEscrow.Entry(CLAIM_A, VICTIM_A, loss);
+        escrow.publish(epochId, entries);
     }
 
     function _assertReport(IIncidentOracle.Report memory report) private {
