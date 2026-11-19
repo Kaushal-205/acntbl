@@ -160,8 +160,9 @@ contract MockOracle is IIncidentOracle, CollateralModule, EIP712 {
     function replaceSeat(uint256 seat, address replacement) external {
         if (msg.sender != arbitrator) revert Unauthorized();
         address prior = committee[seat];
-        if ((!retired[prior] && attesterCredibility[prior] != 0) || replacement == address(0)
+        if (replacement == address(0)
             || attesterBit[replacement] != 0) revert InvalidInput();
+        retired[prior] = true;
         committee[seat] = replacement;
         attesterBit[replacement] = 1 << seat;
         attesterCredibility[replacement] = 10_000;
@@ -226,6 +227,36 @@ contract MockOracle is IIncidentOracle, CollateralModule, EIP712 {
     mapping(bytes32 => bool) public evidenceAvailable;
     event EvidencePublished(bytes32 indexed digest, bytes evidence);
 
+    struct Incident {
+        bytes32 claimId;
+        address victim;
+        uint256 exactLoss;
+        uint8 severity;
+        bytes32 evidenceHash;
+    }
+
+    mapping(uint256 => mapping(bytes32 => bytes32)) public incidentManifestRoot;
+
+    /// @notice One allocation per incident ID. A blended report uses severity 4 and this manifest digest.
+    function publishIncidents(uint256 epochId, Incident[] calldata incidents) external returns (bytes32 digest) {
+        Terms storage terms = epochs[epochId].terms;
+        if (terms.endsAt == 0 || incidents.length == 0 || incidents.length > 128) revert InvalidInput();
+        CompensationEscrow.Entry[] memory entries = new CompensationEscrow.Entry[](incidents.length);
+        for (uint256 i; i < incidents.length; ++i) {
+            Incident calldata incident = incidents[i];
+            if (incident.severity > 3 || (incident.exactLoss > 0 && incident.severity != 0)
+                || !evidenceAvailable[incident.evidenceHash]) revert InvalidInput();
+            uint256 amount = incident.severity == 0 ? incident.exactLoss : terms.severityAmounts[incident.severity - 1];
+            entries[i] = CompensationEscrow.Entry(incident.claimId, incident.victim, amount);
+        }
+        bytes32 root = escrow.publish(epochId, entries);
+        bytes memory manifest = abi.encode(epochId, incidents);
+        digest = keccak256(manifest);
+        incidentManifestRoot[epochId][digest] = root;
+        evidenceAvailable[digest] = true;
+        emit EvidencePublished(digest, manifest);
+    }
+
     function publishEvidence(bytes calldata evidence) external {
         if (evidence.length == 0 || evidence.length > 24_576) revert InvalidInput();
         bytes32 digest = keccak256(evidence);
@@ -267,6 +298,12 @@ contract MockOracle is IIncidentOracle, CollateralModule, EIP712 {
     }
 
     function _validateReport(Terms storage terms, Report calldata report) private view {
+        if (report.severity == 4) {
+            if (report.exactLoss != 0 || report.totalClaims == 0 || report.claimsRoot == bytes32(0)
+                || incidentManifestRoot[report.epochId][report.evidenceHash] != report.claimsRoot
+                || escrow.publishedTotal(report.epochId, report.claimsRoot) != report.totalClaims) revert InvalidInput();
+            return;
+        }
         if (report.evidenceHash == bytes32(0) || report.severity > 3
             || (report.exactLoss != 0 && report.severity != 0)) revert InvalidInput();
         uint256 loss = report.severity == 0 ? report.exactLoss : terms.severityAmounts[report.severity - 1];

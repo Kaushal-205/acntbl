@@ -18,14 +18,14 @@ contract CompensationEscrow is CollateralModule {
 
     /// @notice Publish the canonical claimant set in calldata and logs before the challenge period.
     /// Entries are ordered by unique claim ID. Odd trailing nodes are promoted unmodified.
-    function publish(uint256 epochId, Entry[] calldata entries) external returns (bytes32 root) {
+    function publish(uint256 epochId, Entry[] memory entries) external returns (bytes32 root) {
         uint256 size = entries.length;
         if (size == 0 || size > 128) revert InvalidInput();
         bytes32[] memory nodes = new bytes32[](size);
         uint256 total;
         bytes32 previous;
         for (uint256 i; i < size; ++i) {
-            Entry calldata entry = entries[i];
+            Entry memory entry = entries[i];
             if (entry.id <= previous || entry.victim == address(0) || entry.loss == 0) revert InvalidInput();
             previous = entry.id;
             total += entry.loss;
@@ -48,7 +48,7 @@ contract CompensationEscrow is CollateralModule {
             publishedTotal[epochId][root] = total;
             uint256 prefix;
             for (uint256 i; i < entries.length; ++i) {
-                Entry calldata entry = entries[i];
+                Entry memory entry = entries[i];
                 precedingLoss[root][entry.id] = prefix;
                 prefix += entry.loss;
                 emit ClaimEntry(epochId, root, entry.id, entry.victim, entry.loss);

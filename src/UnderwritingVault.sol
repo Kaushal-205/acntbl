@@ -19,6 +19,9 @@ contract UnderwritingVault is CollateralModule, IUnderwritingVault {
     mapping(uint256 => Pool) public pools;
     mapping(uint256 => mapping(address => uint256)) public sharesOf;
 
+    mapping(uint256 => uint256) public redeemedShares;
+    mapping(uint256 => uint256) public redeemedAssets;
+
     event Staked(uint256 indexed epochId, address indexed staker, uint256 assets);
     event PremiumFunded(uint256 indexed epochId, address indexed funder, uint256 assets);
     event StakeSlashed(uint256 indexed epochId, uint256 assets);
@@ -78,7 +81,11 @@ contract UnderwritingVault is CollateralModule, IUnderwritingVault {
         uint256 shares = sharesOf[epochId][msg.sender];
         if (!pool.released || shares == 0) revert InvalidState();
         delete sharesOf[epochId][msg.sender];
-        amount = Math.mulDiv(shares, pool.principal + pool.premiums, pool.totalShares);
+        uint256 assets = pool.principal + pool.premiums;
+        redeemedShares[epochId] += shares;
+        amount = redeemedShares[epochId] == pool.totalShares
+            ? assets - redeemedAssets[epochId] : Math.mulDiv(shares, assets, pool.totalShares);
+        redeemedAssets[epochId] += amount;
         _pay(msg.sender, amount);
         emit Redeemed(epochId, msg.sender, amount);
     }

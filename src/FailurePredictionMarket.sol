@@ -74,6 +74,8 @@ contract FailurePredictionMarket is CollateralModule {
     }
 
     uint256 public treasuryCredit;
+    mapping(uint256 => uint256) public winningStakeClaimed;
+    mapping(uint256 => uint256) public winningsPaid;
 
     function withdrawFees() external nonReentrant {
         uint256 amount = treasuryCredit;
@@ -109,7 +111,14 @@ contract FailurePredictionMarket is CollateralModule {
         } else if (winningPot == 0) {
             amount = position.yes + position.no;
         } else {
-            amount = Math.mulDiv(failure ? position.yes : position.no, market.yes + market.no, winningPot);
+            uint256 weight = failure ? position.yes : position.no;
+            uint256 assets = market.yes + market.no;
+            amount = Math.mulDiv(weight, assets, winningPot);
+            winningStakeClaimed[epochId] += weight;
+            winningsPaid[epochId] += amount;
+            if (weight != 0 && winningStakeClaimed[epochId] == winningPot) {
+                treasuryCredit += assets - winningsPaid[epochId];
+            }
         }
         _pay(msg.sender, amount);
         emit MarketClaimed(epochId, msg.sender, amount);

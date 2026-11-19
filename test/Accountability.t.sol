@@ -342,6 +342,18 @@ contract AccountabilityTest is Test {
         assertEq(token.balanceOf(signer), 10 ether);
     }
 
+    function testMixedManifestBindsExactAndScheduledVictimLosses() public {
+        MockOracle.Incident[] memory items = new MockOracle.Incident[](2);
+        items[0] = MockOracle.Incident(bytes32(uint256(1)), VICTIM_A, 17 ether, 0, EVIDENCE);
+        items[1] = MockOracle.Incident(bytes32(uint256(2)), VICTIM_B, 0, 1, EVIDENCE);
+        bytes32 digest = oracle.publishIncidents(epochId, items);
+        bytes32 root = oracle.incidentManifestRoot(epochId, digest);
+        assertEq(escrow.publishedTotal(epochId, root), 67 ether);
+        _assertReport(IIncidentOracle.Report(epochId, 0, 4, digest, root, 67 ether));
+        _finalizeUnchallenged();
+        assertEq(token.balanceOf(address(escrow)), 67 ether);
+    }
+
     function testAdmissionRejectsUnpublishedEvidenceAndClaimRoots() public {
         vm.warp(endsAt);
         IIncidentOracle.Report memory r = _noFailure();
