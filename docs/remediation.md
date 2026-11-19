@@ -38,3 +38,7 @@ Run the local pilot evaluator with chronological CSV rows containing market_prob
 ```bash
 python3 analysis/pilot.py observations.csv --operating-cost 0.50 --capital-cost 0.20
 ```
+
+## Receipt monitor
+
+Run `python3 monitor/receipts.py CONTRACT --interval 60` with RPC_URL set and Foundry's cast installed. The monitor reads each receipt at the same finalized block hash, flags active overdue payments and reports credited benefits. A single scan is the default. Each observation includes the reproducible input state and its SHA-256 checksum. Consumers should deduplicate by chain, contract, receipt ID and status. The checksum identifies the exported observation; publish its canonical evidence bytes separately when an epoch assertion requires an on-chain evidence hash. Token amounts use base units. The monitor uses read-only RPC. It can verify this payment workflow; new AI workflows need their own verifiers and attribution rules.
